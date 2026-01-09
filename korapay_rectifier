@@ -1,0 +1,299 @@
+<?php
+
+// Smartpanel SMM KORAPAY PAYMENT RECTIFIER 
+
+// Load SmartPanel configuration //replace with the path to your config.php for Database connection
+require_once '/home/Path_to_your_config.php';
+
+// Korapay secret key
+$KORAPAY_SECRET_KEY = 'YOUR_KORAPAY_SECRET_KEY';
+
+// Local log files
+$logFile     = __DIR__ . '/korapay_log.txt';
+$pendingFile = __DIR__ . '/pending_korapay.json';
+
+// Simple logger
+function logMsg($msg) {
+    global $logFile;
+    file_put_contents(
+        $logFile,
+        date('Y-m-d H:i:s') . " - " . $msg . "\n",
+        FILE_APPEND
+    );
+}
+
+// Only cron should run this file, no browser execution
+
+if (php_sapi_name() !== 'cli') {
+    die("Cron only");
+}
+
+logMsg("=== Rectifier started ===");
+
+// ---------------------------------------------------------------------------
+// DATABASE CONNECTION
+// ---------------------------------------------------------------------------
+$conn = new mysqli(DB_HOST, DB_USER, DB_PASS, DB_NAME);
+if ($conn->connect_error) {
+    logMsg("DB connect error: " . $conn->connect_error);
+    die();
+}
+$conn->set_charset('utf8mb4');
+
+// Load “pending references” from previous runs
+$pending = file_exists($pendingFile)
+    ? json_decode(file_get_contents($pendingFile), true)
+    : [];
+
+if (!is_array($pending)) $pending = [];
+
+// ---------------------------------------------------------------------------
+// STEP 1: Fetch ALL "KoraPay" transactions stuck on 'Waiting'
+// ---------------------------------------------------------------------------
+$stmt = $conn->prepare("
+    SELECT id, amount, transaction_id 
+    FROM general_transaction_logs 
+    WHERE type = 'korapay' AND status = 0
+");
+$stmt->execute();
+$result = $stmt->get_result();
+
+logMsg("Found " . $result->num_rows . " Waiting Korapay transactions");
+
+// ---------------------------------------------------------------------------
+// LOOP THROUGH EACH WAITING TRANSACTION
+// ---------------------------------------------------------------------------
+while ($row = $result->fetch_assoc()) {
+
+    $transId = $row['id'];
+    $amount  = $row['amount'];
+    $korapayRef = trim($row['transaction_id']);
+
+    // If SmartPanel saved no reference, skip it
+    if (!$korapayRef) {
+        logMsg("Skip #{$transId}: no reference");
+        continue;
+    }
+
+    // -----------------------------------------------------------------------
+    // CALL KORAPAY API TO VERIFY WAITING PAYMENT STATUS
+    // -----------------------------------------------------------------------
+    $url = "https://api.korapay.com/merchant/api/v1/charges/{$korapayRef}";
+    $ch = curl_init($url);
+    curl_setopt($ch, CURLOPT_HTTPHEADER, ["Authorization: Bearer {$KORAPAY_SECRET_KEY}"]);
+    curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+    curl_setopt($ch, CURLOPT_TIMEOUT, 30);
+
+    $response = curl_exec($ch);
+    $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+    curl_close($ch);
+
+    logMsg("API call for #{$transId}: HTTP {$httpCode} – " . substr($response, 0, 150));
+
+    // -----------------------------------------------------------------------
+    // IF KORAPAY RETURNS 404 → reference not yet recognized
+    // Save it in pending and retry later
+    // -----------------------------------------------------------------------
+    if ($httpCode == 404) {
+        $pending[$transId] = ['ref' => $korapayRef, 'timestamp' => time()];
+        logMsg("404 Not Found #{$transId}: will retry later");
+        continue;
+    }
+
+    // Temporary API issue → skip, try next cycle
+    if ($httpCode != 200) {
+        logMsg("API error #{$transId}: HTTP {$httpCode}");
+        continue;
+    }
+
+    // Decode Korapay response
+    $data = json_decode($response, true);
+    $korapayStatus = $data['data']['status'] ?? '';
+
+    // -----------------------------------------------------------------------
+    // IF KORAPAY RETURN PAYMENT EXPIRED or FAILED → MARK PAYMENT AS CANCELLED IN DB
+    // -----------------------------------------------------------------------
+    if ($korapayStatus === 'expired' || $korapayStatus === 'failed') {
+
+        $update = $conn->prepare("
+            UPDATE general_transaction_logs 
+            SET status = -1 
+            WHERE id = ? AND status = 0
+        ");
+        $update->bind_param("i", $transId);
+        $update->execute();
+        $update->close();
+
+        logMsg("CANCELLED #{$transId} – {$korapayStatus}");
+
+        unset($pending[$transId]);
+        continue;
+    }
+
+    // -----------------------------------------------------------------------
+    // IF KOAYPAY SAYS PAYMENT SUCCESS → credit  users wallet
+    // -----------------------------------------------------------------------
+    if ($korapayStatus === 'success') {
+
+        // Use SQL transaction to avoid double-credit
+        $conn->begin_transaction();
+
+        // Lock the row
+        $stmtT = $conn->prepare("
+            SELECT uid, amount, txn_fee 
+            FROM general_transaction_logs 
+            WHERE id = ? AND status = 0
+            FOR UPDATE
+        ");
+        $stmtT->bind_param("i", $transId);
+        $stmtT->execute();
+        $txn = $stmtT->get_result()->fetch_assoc();
+        $stmtT->close();
+
+        // If webhook already processed it → skip to avoid duplication
+        if (!$txn) {
+            $conn->rollback();
+            unset($pending[$transId]);
+            logMsg("Skip #{$transId}: already processed by webhook");
+            continue;
+        }
+
+        $credit = $txn['amount'] - ($txn['txn_fee'] ?? 0);
+
+        // Credit wallet
+        $stmtU = $conn->prepare("
+            UPDATE general_users 
+            SET balance = balance + ?
+            WHERE id = ?
+        ");
+        $stmtU->bind_param("di", $credit, $txn['uid']);
+        $stmtU->execute();
+        $stmtU->close();
+
+        // Mark complete
+        $stmtP = $conn->prepare("
+            UPDATE general_transaction_logs 
+            SET status = 1 
+            WHERE id = ? AND status = 0
+        ");
+        $stmtP->bind_param("i", $transId);
+        $stmtP->execute();
+        $stmtP->close();
+
+        $conn->commit();
+
+        logMsg("APPROVED #{$transId}: credited ₦{$credit}");
+
+        unset($pending[$transId]);
+    }
+    else {
+        // Not success yet → save for rechecking later
+        if (!isset($pending[$transId])) {
+            $pending[$transId] = [
+                'ref' => $korapayRef,
+                'timestamp' => time()
+            ];
+            logMsg("Pending #{$transId}: {$korapayStatus}");
+        }
+    }
+
+    // Prevent Korapay rate-limit
+    usleep(500000);
+}
+
+// ===========================================================================
+// STEP 2: FINAL RECHECK FOR ALL PENDING TRANSACTIONS AFTER 90 MINUTES
+// ===========================================================================
+foreach ($pending as $transId => $info) {
+
+    if (time() - $info['timestamp'] > 5400) { // 5400s = 90min
+
+        $url = "https://api.korapay.com/merchant/api/v1/charges/" . $info['ref'];
+        $ch = curl_init($url);
+        curl_setopt($ch, CURLOPT_HTTPHEADER, ["Authorization: Bearer " . $KORAPAY_SECRET_KEY]);
+        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
+
+        $response = curl_exec($ch);
+        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
+        curl_close($ch);
+
+        logMsg("Final recheck #{$transId}: HTTP {$httpCode}");
+
+        if ($httpCode == 200) {
+
+            $data = json_decode($response, true);
+            $korapayStatus = $data['data']['status'] ?? '';
+
+            // if user pay late  → still credit wallet
+            if ($korapayStatus === 'success') {
+
+                $conn->begin_transaction();
+
+                $stmtT = $conn->prepare("
+                    SELECT uid, amount, txn_fee 
+                    FROM general_transaction_logs 
+                    WHERE id = ? AND status = 0
+                    FOR UPDATE
+                ");
+                $stmtT->bind_param("i", $transId);
+                $stmtT->execute();
+                $txn = $stmtT->get_result()->fetch_assoc();
+                $stmtT->close();
+
+                if (!$txn) {
+                    $conn->rollback();
+                    unset($pending[$transId]);
+                    logMsg("Skip #{$transId}: already processed");
+                    continue;
+                }
+
+                $credit = $txn['amount'] - ($txn['txn_fee'] ?? 0);
+
+                $stmtU = $conn->prepare("
+                    UPDATE general_users 
+                    SET balance = balance + ?
+                    WHERE id = ?
+                ");
+                $stmtU->bind_param("di", $credit, $txn['uid']);
+                $stmtU->execute();
+                $stmtU->close();
+
+                $stmtP = $conn->prepare("
+                    UPDATE general_transaction_logs 
+                    SET status = 1 
+                    WHERE id = ? AND status = 0
+                ");
+                $stmtP->bind_param("i", $transId);
+                $stmtP->execute();
+                $stmtP->close();
+
+                $conn->commit();
+
+                logMsg("LATE APPROVED #{$transId}: credited ₦{$credit}");
+            }
+            else {
+                // Final cancellation
+                $update = $conn->prepare("
+                    UPDATE general_transaction_logs 
+                    SET status = -1 
+                    WHERE id = ? AND status = 0
+                ");
+                $update->bind_param("i", $transId);
+                $update->execute();
+                $update->close();
+
+                logMsg("AUTO CANCELLED #{$transId}: no payment after timeout");
+            }
+        }
+
+        unset($pending[$transId]);
+    }
+}
+
+// Save remaining pending list
+file_put_contents($pendingFile, json_encode($pending));
+
+logMsg("=== Rectifier finished ===");
+$conn->close();
+echo "Done.\n";
+
