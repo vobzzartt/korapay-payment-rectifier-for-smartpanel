@@ -60,6 +60,8 @@ $result = $stmt->get_result();
 
 logMsg("Found " . $result->num_rows . " Waiting Korapay transactions");
 
+$activeTransIds = [];
+
 // ---------------------------------------------------------------------------
 // LOOP THROUGH EACH WAITING TRANSACTION
 // ---------------------------------------------------------------------------
@@ -69,11 +71,23 @@ while ($row = $result->fetch_assoc()) {
     $amount  = $row['amount'];
     $korapayRef = trim($row['transaction_id']);
 
+    $activeTransIds[] = $transId;
+
     // If SmartPanel saved no reference, skip it
     if (!$korapayRef) {
         logMsg("Skip #{$transId}: no reference");
         continue;
     }
+
+    // Set initial timestamp for new pending references
+    if (!isset($pending[$transId])) {
+        $pending[$transId] = [
+            'ref' => $korapayRef,
+            'timestamp' => time()
+        ];
+    }
+
+    $isTimedOut = (time() - $pending[$transId]['timestamp']) > 5400; // 5400s = 90min
 
     // -----------------------------------------------------------------------
     // CALL KORAPAY API TO VERIFY WAITING PAYMENT STATUS
@@ -90,25 +104,31 @@ while ($row = $result->fetch_assoc()) {
 
     logMsg("API call for #{$transId}: HTTP {$httpCode} – " . substr($response, 0, 150));
 
-    // -----------------------------------------------------------------------
-    // IF KORAPAY RETURNS 404 → reference not yet recognized
-    // Save it in pending and retry later
-    // -----------------------------------------------------------------------
-    if ($httpCode == 404) {
-        $pending[$transId] = ['ref' => $korapayRef, 'timestamp' => time()];
-        logMsg("404 Not Found #{$transId}: will retry later");
-        continue;
-    }
-
-    // Temporary API issue → skip, try next cycle
-    if ($httpCode != 200) {
-        logMsg("API error #{$transId}: HTTP {$httpCode}");
-        continue;
-    }
-
-    // Decode Korapay response
     $data = json_decode($response, true);
     $korapayStatus = $data['data']['status'] ?? '';
+
+    // If 404 or non-200 but timed out, cancel it
+    if ($httpCode != 200) {
+        if ($isTimedOut) {
+            $update = $conn->prepare("
+                UPDATE general_transaction_logs
+                SET status = -1
+                WHERE id = ? AND status = 0
+            ");
+            $update->bind_param("i", $transId);
+            $update->execute();
+            $update->close();
+
+            logMsg("AUTO CANCELLED #{$transId}: API HTTP {$httpCode} after timeout");
+            unset($pending[$transId]);
+        } else {
+            logMsg("Pending #{$transId}: HTTP {$httpCode}, will retry later");
+        }
+
+        // Prevent Korapay rate-limit
+        usleep(500000);
+        continue;
+    }
 
     // -----------------------------------------------------------------------
     // IF KORAPAY RETURN PAYMENT EXPIRED or FAILED → MARK PAYMENT AS CANCELLED IN DB
@@ -131,7 +151,7 @@ while ($row = $result->fetch_assoc()) {
     }
 
     // -----------------------------------------------------------------------
-    // IF KOAYPAY SAYS PAYMENT SUCCESS → credit  users wallet
+    // IF KORAPAY SAYS PAYMENT SUCCESS → credit  users wallet
     // -----------------------------------------------------------------------
     if ($korapayStatus === 'success') {
 
@@ -187,12 +207,20 @@ while ($row = $result->fetch_assoc()) {
         unset($pending[$transId]);
     }
     else {
-        // Not success yet → save for rechecking later
-        if (!isset($pending[$transId])) {
-            $pending[$transId] = [
-                'ref' => $korapayRef,
-                'timestamp' => time()
-            ];
+        // Not success yet → check if it timed out
+        if ($isTimedOut) {
+            $update = $conn->prepare("
+                UPDATE general_transaction_logs
+                SET status = -1
+                WHERE id = ? AND status = 0
+            ");
+            $update->bind_param("i", $transId);
+            $update->execute();
+            $update->close();
+
+            logMsg("AUTO CANCELLED #{$transId}: no payment after timeout");
+            unset($pending[$transId]);
+        } else {
             logMsg("Pending #{$transId}: {$korapayStatus}");
         }
     }
@@ -201,92 +229,10 @@ while ($row = $result->fetch_assoc()) {
     usleep(500000);
 }
 
-// ===========================================================================
-// STEP 2: FINAL RECHECK FOR ALL PENDING TRANSACTIONS AFTER 90 MINUTES
-// ===========================================================================
-foreach ($pending as $transId => $info) {
-
-    if (time() - $info['timestamp'] > 5400) { // 5400s = 90min
-
-        $url = "https://api.korapay.com/merchant/api/v1/charges/" . $info['ref'];
-        $ch = curl_init($url);
-        curl_setopt($ch, CURLOPT_HTTPHEADER, ["Authorization: Bearer " . $KORAPAY_SECRET_KEY]);
-        curl_setopt($ch, CURLOPT_RETURNTRANSFER, true);
-
-        $response = curl_exec($ch);
-        $httpCode = curl_getinfo($ch, CURLINFO_HTTP_CODE);
-        curl_close($ch);
-
-        logMsg("Final recheck #{$transId}: HTTP {$httpCode}");
-
-        if ($httpCode == 200) {
-
-            $data = json_decode($response, true);
-            $korapayStatus = $data['data']['status'] ?? '';
-
-            // if user pay late  → still credit wallet
-            if ($korapayStatus === 'success') {
-
-                $conn->begin_transaction();
-
-                $stmtT = $conn->prepare("
-                    SELECT uid, amount, txn_fee 
-                    FROM general_transaction_logs 
-                    WHERE id = ? AND status = 0
-                    FOR UPDATE
-                ");
-                $stmtT->bind_param("i", $transId);
-                $stmtT->execute();
-                $txn = $stmtT->get_result()->fetch_assoc();
-                $stmtT->close();
-
-                if (!$txn) {
-                    $conn->rollback();
-                    unset($pending[$transId]);
-                    logMsg("Skip #{$transId}: already processed");
-                    continue;
-                }
-
-                $credit = $txn['amount'] - ($txn['txn_fee'] ?? 0);
-
-                $stmtU = $conn->prepare("
-                    UPDATE general_users 
-                    SET balance = balance + ?
-                    WHERE id = ?
-                ");
-                $stmtU->bind_param("di", $credit, $txn['uid']);
-                $stmtU->execute();
-                $stmtU->close();
-
-                $stmtP = $conn->prepare("
-                    UPDATE general_transaction_logs 
-                    SET status = 1 
-                    WHERE id = ? AND status = 0
-                ");
-                $stmtP->bind_param("i", $transId);
-                $stmtP->execute();
-                $stmtP->close();
-
-                $conn->commit();
-
-                logMsg("LATE APPROVED #{$transId}: credited ₦{$credit}");
-            }
-            else {
-                // Final cancellation
-                $update = $conn->prepare("
-                    UPDATE general_transaction_logs 
-                    SET status = -1 
-                    WHERE id = ? AND status = 0
-                ");
-                $update->bind_param("i", $transId);
-                $update->execute();
-                $update->close();
-
-                logMsg("AUTO CANCELLED #{$transId}: no payment after timeout");
-            }
-        }
-
-        unset($pending[$transId]);
+// Cleanup orphans from pending that are no longer status=0
+foreach (array_keys($pending) as $pId) {
+    if (!in_array($pId, $activeTransIds)) {
+        unset($pending[$pId]);
     }
 }
 
