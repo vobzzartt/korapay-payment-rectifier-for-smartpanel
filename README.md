@@ -1,155 +1,120 @@
-# CPANEL MYSQL DATABASE AUTO BACKUP
+# Korapay Payment Rectifier for SmartPanel
 
-Simple PHP script that sends a copy of your database to you on Telegram each time your cron runs.
+Cron script that fixes a common SmartPanel issue: users pay successfully, but Korapay webhook delays leave transactions stuck on "Waiting".
+
+This script rechecks those transactions directly from Korapay and updates the wallet correctly.
 
 ---
 
-## Why this exists
+## What it does
 
-There have been many recent cyber attacks including AI-driven automated attacks where attackers gain access to servers and databases.
+- Finds all "Waiting" Korapay transactions
+- Verifies status directly from Korapay
+- Credits wallet if payment is successful
+- Cancels expired or failed transactions
+- Rechecks pending ones after 90 minutes
+- Skips anything already processed
 
-Once a server is compromised, data can be deleted, sold on the dark web, modified, or stolen.
+---
 
-This script makes sure your database is backed up outside your server and delivered directly to your Telegram account, so you always have a safe copy.
+## Why this was built
+
+SmartPanel depends on webhooks for wallet funding.
+
+When Korapay webhooks delay or fail:
+- Payments go through but wallets are not credited
+- Admins start handling funding manually
+- "Waiting" transactions pile up
+- Users lose trust
+
+This script handles that by checking Korapay directly instead of relying on webhooks.
 
 ---
 
 ## How it works
 
-- Connects to your MySQL database
-- Dumps all tables into a .sql file
-- Sends the backup file to your Telegram bot
-- Deletes the file from the server after sending
+1. Fetch all "Waiting" transactions from general_transaction_logs
+2. For each transaction:
+   - Check status from Korapay
+   - If success → credit wallet
+   - If expired or failed → cancel it
+   - If still pending → save for later
+3. Pending transactions are stored in pending_korapay.json
+4. After 90 minutes, pending ones are checked again
+5. Processed transactions are removed from pending automatically
+
+All updates run inside MySQL transactions.
 
 ---
 
-## Setup
+## Files created
 
-1. Upload the script to your server
+- korapay_log.txt  
+- pending_korapay.json  
 
-2. Update the config file path inside the script:
-
-$config_path = '/path/to/your/config.php';
-
-This should point to your application's database config file.
-
-If the path is not correct, update it to match your server.
+Both are stored in the same directory as the script.
 
 ---
 
-## Database config
+## Installation
 
-Your config file must define these constants:
+1. Upload the script
 
-DB_HOST  
-DB_USER  
-DB_PASS  
-DB_NAME  
-TIMEZONE  
+Example path:
+/home/username/public_html/cron/korapay_rectifier.php
 
-Example:
+2. Set your config path
 
-define('DB_HOST', 'localhost');
-define('DB_USER', 'your_database_user');
-define('DB_PASS', 'your_database_password');
-define('DB_NAME', 'your_database_name');
-define('TIMEZONE', 'your_timezone');
+require_once '/home/yourusername/public_html/app/config.php';
 
-If these values do not match your database, update them accordingly.
+3. Add your Korapay key
 
----
+$KORAPAY_SECRET_KEY = 'YOUR_KORAPAY_SECRET_KEY';
 
-## Required constants
+4. Set permissions
 
-The script expects these:
-
-DB_HOST  
-DB_USER  
-DB_PASS  
-DB_NAME  
-TIMEZONE  
-
-If your system uses different names, update them in the script.
+chmod 755 cron/
+chmod 644 cron/korapay_log.txt
+chmod 644 cron/pending_korapay.json
 
 ---
 
-## Telegram setup
+## Cron
 
-1. Open Telegram and search for BotFather  
-2. Create a bot and copy your bot token  
-3. Get your chat ID  
+Run every minute:
 
-4. Replace in the script:
+* * * * * /usr/bin/php -q /home/username/public_html/cron/korapay_rectifier.php
 
-define('TELEGRAM_BOT_TOKEN', 'your_bot_token');
-define('TELEGRAM_CHAT_ID', 'your_chat_id');
+Runs in CLI only. Browser access is blocked.
 
 ---
 
-## Why chat ID matters
+## Status handling
 
-Backups are sent only to the chat ID you set.
-
-- Only your Telegram account receives the backup  
-- No public access  
-- No shared storage  
-
-Access depends on:
-- Your bot token
-- Your Telegram account
-
----
-
-## Telegram security
-
-- Enable Two-Step Verification in Telegram  
-- Keep your bot token private  
-- Do not expose this script publicly  
-- Restrict server access  
-
-Telegram provides secure, unlimited cloud storage, so your backups remain available each time
-
----
-
-## Cron setup
-
-Run the script using cron.
-
-Example:
-
-* * * * * /usr/bin/php /path/to/backup.php
-
-You can change the schedule depending on how often you want backups.
-
----
-
-## Restore
-
-To restore your database:
-
-Option 1:
-- Open phpMyAdmin  
-- Select your database  
-- Click Import  
-- Upload the .sql file  
-
-Option 2:
-
-mysql -u USER -p DB_NAME < backup.sql
-
-This will overwrite existing data.
+- success → credit wallet  
+- expired → cancel  
+- failed → cancel  
+- pending → recheck later  
 
 ---
 
 ## Notes
 
-- Runs only from CLI  
-- Browser access is blocked  
-- Backup is sent and removed from the server  
+- Detects and skips already processed transactions  
+- Prevents double crediting  
+- Keeps pending list clean  
+
+---
+
+## Requirements
+
+- SmartPanel SMM v3+
+- Korapay API key
+- PHP with curl enabled
+- Cron access
 
 ---
 
 ## License
 
-Free to folk with and contribute.
-Built with ❤️ from Victor Bodude www.victorbodude.com
+MIT
